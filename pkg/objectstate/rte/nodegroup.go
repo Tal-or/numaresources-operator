@@ -21,15 +21,18 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	nropv1 "github.com/openshift-kni/numaresources-operator/api/v1"
 	nodegroupv1 "github.com/openshift-kni/numaresources-operator/api/v1/helper/nodegroup"
 	"github.com/openshift-kni/numaresources-operator/internal/api/annotations"
+	"github.com/openshift-kni/numaresources-operator/pkg/hash"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectnames"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectstate"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectstate/compare"
 	"github.com/openshift-kni/numaresources-operator/pkg/objectstate/merge"
+	rteupdate "github.com/openshift-kni/numaresources-operator/pkg/objectupdate/rte"
 )
 
 type nodeGroupFinder struct {
@@ -53,6 +56,11 @@ func (obj nodeGroupFinder) UpdateFromClient(ctx context.Context, cli client.Clie
 	if dsm.daemonSetError = cli.Get(ctx, key, ds); dsm.daemonSetError == nil {
 		dsm.daemonSet = ds
 	}
+	cm := &corev1.ConfigMap{}
+	if err := cli.Get(ctx, key, cm); err == nil {
+		// we're storing the updated hash only in the case that kubelet controller created a configmap
+		dsm.rteComputedConfigHash = hash.ConfigMapData(cm)
+	}
 	obj.em.daemonSets[generatedName] = dsm
 }
 
@@ -74,6 +82,8 @@ func (obj nodeGroupFinder) FindState(mf Manifests, tree nodegroupv1.Tree) []obje
 
 	desiredDaemonSet := mf.Core.DaemonSet.DeepCopy()
 	desiredDaemonSet.Name = generatedName
+	// it's possible that the hash will be empty if kubelet controller hasn't created a configmap
+	rteupdate.DaemonSetHashAnnotation(desiredDaemonSet, existingDaemonSet.rteComputedConfigHash)
 
 	var updateError error
 	desiredDaemonSet.Spec.Template.Spec.NodeSelector = map[string]string{
