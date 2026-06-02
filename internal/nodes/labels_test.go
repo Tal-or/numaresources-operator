@@ -182,6 +182,37 @@ func TestLabelForTree_UnmanagedPoolNotLabeled(t *testing.T) {
 	}
 }
 
+func TestLabelForTree_FallbackToManagedPool(t *testing.T) {
+	worker := newTestMCPWithSelector("worker", map[string]string{"node-role.kubernetes.io/worker": ""})
+	workerB := newTestMCPWithSelector("workerB", map[string]string{"node-role.kubernetes.io/workerB": ""})
+
+	// node matches both worker and workerB labels, MCO primary = workerB (custom > worker),
+	// but only worker is in this tree's NodeGroup -> should fall back to worker
+	node := newTestNode("node1", map[string]string{
+		"node-role.kubernetes.io/worker":  "",
+		"node-role.kubernetes.io/workerB": "",
+	})
+
+	cli := buildFakeClient(worker, workerB, node)
+	ctx := context.Background()
+
+	allPools := []mcov1.MachineConfigPool{*worker, *workerB}
+	allNodes := []corev1.Node{*node}
+	tree := nodegroupv1.Tree{
+		NodeGroup:          &nropv1.NodeGroup{},
+		MachineConfigPools: []*mcov1.MachineConfigPool{worker},
+	}
+
+	if err := LabelForTree(ctx, cli, platform.OpenShift, tree, allPools, allNodes); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	val, ok := getLabel(ctx, cli, "node1")
+	if !ok || val != "worker" {
+		t.Fatalf("expected node1 to fall back to managed pool worker, got %q (exists=%v)", val, ok)
+	}
+}
+
 func TestLabelForTree_HyperShiftNoOp(t *testing.T) {
 	poolName := "my-nodepool"
 	node1 := newTestNode("node1", map[string]string{

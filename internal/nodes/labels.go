@@ -60,27 +60,29 @@ func LabelForTree(ctx context.Context, cli client.Client, plat platform.Platform
 			continue
 		}
 		for i := range allNodes {
-			if sel.Matches(labels.Set(allNodes[i].Labels)) {
-				nodesByName[allNodes[i].Name] = &allNodes[i]
+			node := &allNodes[i]
+			if sel.Matches(labels.Set(node.Labels)) {
+				nodesByName[node.Name] = node
 			}
 		}
 	}
 
-	// single pass: determine primary pool for each node and patch the label
+	// determine the best managed pool for each node and patch the label.
+	// Uses MCO priority (master > custom > worker) but falls back to the next
+	// matching pool when the primary pool is not in the NRO NodeGroup, so nodes
+	// retain RTE coverage even when their MCO primary pool is unmanaged.
 	desiredLabels := map[string]string{} // node name -> desired pool name
 	for nodeName, node := range nodesByName {
-		primaryPool, err := mcpools.GetPrimaryPoolForNode(allPools, node)
+		nodePools, err := mcpools.GetPoolsForNode(allPools, node)
 		if err != nil {
-			klog.V(4).InfoS("Cannot determine primary pool for node, skipping", "node", nodeName, "error", err)
+			klog.V(4).InfoS("Cannot determine pools for node, skipping", "node", nodeName, "error", err)
 			continue
 		}
-		if primaryPool == nil {
+		poolName := firstManagedPool(nodePools, managedPools)
+		if poolName == "" {
 			continue
 		}
-		if !managedPools.Has(primaryPool.Name) {
-			continue
-		}
-		desiredLabels[nodeName] = primaryPool.Name
+		desiredLabels[nodeName] = poolName
 	}
 
 	for name, poolName := range desiredLabels {
@@ -152,6 +154,19 @@ func removeLabel(ctx context.Context, cli client.Client, node *corev1.Node) erro
 	base := node.DeepCopy()
 	delete(node.Labels, nrolabels.NodePrimaryPool)
 	return cli.Patch(ctx, node, client.MergeFrom(base))
+}
+
+// firstManagedPool returns the name of the first pool in the priority-ordered
+// list that is managed by NRO. This ensures that when a node's MCO primary pool
+// (e.g. a custom MCP) is not in the NodeGroup, the node falls back to a
+// managed pool (e.g. worker) instead of losing RTE coverage.
+func firstManagedPool(pools []*mcov1.MachineConfigPool, managed sets.Set[string]) string {
+	for _, p := range pools {
+		if managed.Has(p.Name) {
+			return p.Name
+		}
+	}
+	return ""
 }
 
 func managedPoolNames(tree nodegroupv1.Tree) sets.Set[string] {
