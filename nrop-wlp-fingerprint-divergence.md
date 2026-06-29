@@ -168,3 +168,151 @@ deployed alongside WLP for the first time.
   breaks with WLP's non-device extended resources.
 - This is not an OCP-specific fix candidate in `scheduler-plugins` — WLP is
   an OpenShift feature that upstream `scheduler-plugins` has no awareness of.
+
+  ## Possible Solutions (ordered by scope)
+
+### Solution 1: Downstream-specific patch
+
+d/s specific solution on <https://github.com/openshift-kni/scheduler-plugins> (first d/s patch)
+to exclude WLP devices:
+
+```go
+   func IsExclusive(qos corev1.PodQOSClass, resource corev1.ResourceName,quantity resource.Quantity) bool {
+      if IsWorkloadPartitionigDevice(resource) {
+         return false
+      }
+      // treats ALL non-native resources as exclusive
+      if !v1helper.IsNativeResource(resource) {
+         return true
+      }
+      // ...native resource checks (QoS, integral CPU, etc.)
+   }
+   ```
+
+#### Downsides
+
+   1. Require drifting from the u/s code which in turn makes the RESYNC procedure more complex
+   2. Address only WLP devices. future configuration of extended resources will break PFP calculation again.
+
+### Solution 2: Upstream contribution
+
+   u/s contribution to [kubernetes-sigs/scheduler-plugins](https://github.com/kubernetes-sigs/scheduler-plugins):
+   add a configurable **excluded resource prefixes** list to the
+   `NodeResourceTopologyCache` config.
+
+#### Motivation (upstream-generic framing)
+
+   The `IsExclusive()` function assumes all non-native resources are
+   device-plugin-backed and therefore exclusive. This assumption is incorrect
+   for **extended resources that are not backed by device plugins** — they are
+   advertised directly by kubelet in node capacity but have no allocation
+   records in kubelet's PodResources API. When the `EnabledExclusiveResources`
+   fingerprinting method is used, the scheduler counts pods with these
+   resources as exclusive (via the Kubernetes API), while RTE does not see
+   them (via the PodResources API). The fingerprints permanently diverge,
+   blocking NUMA-aware scheduling.
+
+   **This is a generic problem (this is the key selling point) — any extended resource injected by an admission
+   webhook or advertised directly by kubelet (without a device plugin) will
+   trigger this divergence.**
+
+#### Config change
+
+   Add `ExcludedResourcePrefixes []string` to `NodeResourceTopologyCache`:
+
+   ```go
+   type NodeResourceTopologyCache struct {
+       // ...existing fields...
+
+       // ExcludedResourcePrefixes is a list of resource name prefixes that
+       // should NOT be treated as exclusive resources when computing pod
+       // fingerprints. Extended resources that are not backed by device
+       // plugins are invisible to kubelet's PodResources API and would cause
+       // a permanent fingerprint mismatch between RTE and the scheduler.
+       // Example: ["management.workload.openshift.io/"]
+       ExcludedResourcePrefixes []string `json:"excludedResourcePrefixes,omitempty"`
+   }
+   ```
+
+   Files to change:
+
+- `apis/config/types.go` — internal type
+- `apis/config/v1/types.go` — versioned type with JSON tags
+- `apis/config/validation/validation_pluginargs.go` — reject empty strings
+- Run `hack/update-codegen.sh` for deepcopy + conversion
+- No default needed (nil = no exclusions = backwards compatible)
+
+#### Code change — ExclusionChecker
+
+   Add an `ExclusionChecker` struct to `resourcerequests/exclusive.go`:
+
+   ```go
+   type ExclusionChecker struct {
+       excludedPrefixes []string
+   }
+
+   func NewExclusionChecker(prefixes []string) *ExclusionChecker {
+       if len(prefixes) == 0 { return nil }
+       return &ExclusionChecker{excludedPrefixes: prefixes}
+   }
+
+   func (ec *ExclusionChecker) isExcluded(name corev1.ResourceName) bool {
+       if ec == nil { return false }
+       for _, p := range ec.excludedPrefixes {
+           if strings.HasPrefix(string(name), p) { return true }
+       }
+       return false
+   }
+   ```
+
+   Convert `IsExclusive`, `AreExclusiveForPod`, and `IncludeNonNative` to
+   methods on `*ExclusionChecker` (nil receiver = current behavior):
+
+   ```go
+   func (ec *ExclusionChecker) IsExclusive(qos corev1.PodQOSClass,
+       resource corev1.ResourceName, quantity resource.Quantity) bool {
+       if ec.isExcluded(resource) {
+           return false
+       }
+       if !v1helper.IsNativeResource(resource) {
+           return true
+       }
+       // ...existing logic unchanged...
+   }
+   ```
+
+#### Threading through callers
+
+- **`cache/overreserve.go`** — `NewOverReserve()` already receives
+     `cfg *NodeResourceTopologyCache`. Create `ExclusionChecker` from
+     `cfg.ExcludedResourcePrefixes`, store on `OverReserve` struct. Pass to
+     `makeNodeToPodDataMap()` to replace the direct
+     `resourcerequests.AreExclusiveForPod(pod)` call (line 396).
+- **`cache/foreign_pods.go`** — add a package-level `exclusionChecker`
+     alongside the existing `onlyExclusiveResources` bool (same pattern).
+     `IsForeignPod()` line 93 uses it via
+     `exclusionChecker.AreExclusiveForPod(pod)`.
+- **`filter.go`** — store checker on `TopologyMatch` struct, use in
+     line 181 for `IncludeNonNative`.
+
+#### User-facing scheduler config
+
+   ```yaml
+   apiVersion: kubescheduler.config.k8s.io/v1
+   kind: KubeSchedulerConfiguration
+   profiles:
+     - pluginConfig:
+         - name: NodeResourceTopologyMatch
+           args:
+             cache:
+               excludedResourcePrefixes:
+                 - "management.workload.openshift.io/"
+   ```
+
+#### Downsides
+
+   The scheduler doesn't auto-detect non-device extended resources — the
+   prefix list must be set in the manifest. Since NROP generates the
+   scheduler config, it would need to detect WLP and inject the prefix.
+   This requires changes in both **scheduler-plugins** (config + code) and
+   **numaresources-operator** (manifest generation).
