@@ -1,0 +1,74 @@
+name: Autofix govulncheck vulnerabilities
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  workflow_dispatch: {}
+  issue_comment:
+    types: [created]
+
+env:
+  GOLANG_VERSION: 1.25.12
+  MODEL: google/gemini-3.6-flash
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/fix-vulns') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOLANG_VERSION }}
+
+      - name: Acknowledge trigger
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.issue.number }}" \
+            --body "ai-bot: govulncheck autofix triggered — running vulnerability scan."
+
+      - name: Run govulncheck
+        id: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-package: "./..."
+          go-version-input: ${{ env.GOLANG_VERSION }}
+          output-file: govulncheck-output.txt
+          repo-checkout: false
+        continue-on-error: true
+
+      - name: Run OpenCode to fix vulnerabilities
+        if: steps.govulncheck.outcome == 'failure'
+        uses: anomalyco/opencode/github@latest
+        env:
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.NROP_ASSISTANT_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: ${{ env.MODEL }}
+          use_github_token: true
+          prompt: |
+            The file `govulncheck-output.txt` contains a govulncheck vulnerability report.
+
+            Fix the reported vulnerabilities by bumping the affected Go packages in go.mod
+            to versions that resolve them. Run `go mod tidy` and `go mod vendor`, then
+            verify the build passes with `go build ./...`.
+
+            Requirements:
+            - Branch from `origin/main` using a branch name like `fix/govulncheck-<vuln-id>`.
+            - If that branch already exists remotely, stop — a fix is already in progress.
+            - Commit message format: "deps: bump <pkg> to <version> to fix <vuln-id>".
+            - Push the branch and open a PR against main with title prefix `[ai-bot]`.
+            - PR body must list bumped packages and vulnerability IDs.
